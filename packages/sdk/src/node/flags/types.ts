@@ -1,4 +1,4 @@
-import type { FlagsConfig, FlagsManagerOptions } from "@/core/flags/types";
+import type {FlagsManagerOptions } from "@/core/flags/types";
 
 export interface ServerStorageConfig {
 	/** Cache TTL in milliseconds (default: 5 minutes) */

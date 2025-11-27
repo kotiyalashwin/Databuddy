@@ -26,11 +26,11 @@ export async function createAndInitializeServerFlagsManager(
 /**
  * Hook-like function for server components to check flag status
  */
-export async function getServerFlag(
+export function getServerFlag(
 	flagsManager: ServerFlagsManager,
 	key: string
 ): Promise<FlagResult> {
-	return await flagsManager.getFlag(key);
+	return flagsManager.getFlag(key);
 }
 
 /**
@@ -47,8 +47,8 @@ export async function isFlagEnabled(
 /**
  * Fetch all flags at once (useful for initialization)
  */
-export async function fetchAllServerFlags(
+export function fetchAllServerFlags(
 	flagsManager: ServerFlagsManager
 ): Promise<void> {
-	return await flagsManager.fetchAllFlags();
+	return flagsManager.fetchAllFlags();
 }

@@ -11,6 +11,26 @@ import { ServerFlagStorage } from "./server-storage";
 /**
  * Server-side flags manager optimized for Next.js server components,
  * API routes, and serverless environments.
+ *
+ * **Serverless Usage**: In serverless environments, call the cleanup() method
+ * when the manager instance is no longer needed to prevent memory leaks from
+ * outstanding timers. The manager uses unref'd timers to avoid keeping the
+ * event loop alive.
+ *
+ * @example
+ * ```typescript
+ * // Serverless function example
+ * export async function handler() {
+ *   const manager = new ServerFlagsManager(options);
+ *   try {
+ *     await manager.waitForInitialization();
+ *     const flag = await manager.getFlag('my-feature');
+ *     return { enabled: flag.enabled };
+ *   } finally {
+ *     manager.cleanup(); // Important for serverless environments
+ *   }
+ * }
+ * ```
  */
 export class ServerFlagsManager implements FlagsManager {
 	private config: FlagsConfig;
@@ -23,6 +43,8 @@ export class ServerFlagsManager implements FlagsManager {
 	private enableMemoryCache: boolean;
 	private readonly FETCHING_STATE_TTL: number;
 	private initialized: Promise<void>;
+	private _initialized = false;
+	private activeTimers: Set<NodeJS.Timeout> = new Set();
 
 	constructor(options: ServerFlagsManagerOptions) {
 		this.config = this.withDefaults(options.config);
@@ -44,7 +66,13 @@ export class ServerFlagsManager implements FlagsManager {
 			fetchingStateTtl: this.FETCHING_STATE_TTL,
 		});
 
-		this.initialized = this.initialize();
+		this.initialized = this.initialize()
+			.then(() => {
+				this._initialized = true;
+			})
+			.catch(() => {
+				this._initialized = false;
+			});
 	}
 
 	private withDefaults(config: FlagsConfig): FlagsConfig {
@@ -82,7 +110,7 @@ export class ServerFlagsManager implements FlagsManager {
 	 * Check if the manager has completed initialization
 	 */
 	public get isInitialized(): boolean {
-		return this.initialized !== null && this.initialized !== undefined;
+		return this._initialized;
 	}
 
 	private loadCachedFlags(): void {
@@ -189,7 +217,7 @@ export class ServerFlagsManager implements FlagsManager {
 		// Check persistent cache
 		if (!this.config.skipStorage) {
 			try {
-				const cached = await this.storage.get(key);
+				const cached = this.storage.get(key);
 				if (cached) {
 					logger.debug(`Cache: ${key}`);
 					this.memoryFlags[key] = cached;
@@ -267,9 +295,12 @@ export class ServerFlagsManager implements FlagsManager {
 		} finally {
 			this.pendingFlags.delete(key);
 			// Keep fetching state for a short time for sync detection
-			setTimeout(() => {
+			const timer = setTimeout(() => {
 				this.fetchingStates.delete(key);
+				this.activeTimers.delete(timer);
 			}, this.FETCHING_STATE_TTL);
+			timer.unref(); // Prevent keeping event loop alive in serverless environments
+			this.activeTimers.add(timer);
 		}
 	}
 
@@ -305,7 +336,7 @@ export class ServerFlagsManager implements FlagsManager {
 	}
 
 	refresh(forceClear = false): void {
-		// Don't await initialization here to maintain interface compatibility
+		// Don't await initialization here to maintaiKn interface compatibility
 		// The initialization will be awaited within fetchAllFlags when called
 		this.initialized
 			.then(() => {
@@ -324,7 +355,9 @@ export class ServerFlagsManager implements FlagsManager {
 					}
 				}
 
-				this.fetchAllFlags();
+				this.fetchAllFlags().catch(err=>{
+                    logger.error("Error during refresh fetch:",err)
+                });
 			})
 			.catch((err) => {
 				logger.error("Error during refresh initialization:", err);
@@ -377,5 +410,33 @@ export class ServerFlagsManager implements FlagsManager {
 
 	private notifyFlagsUpdate(): void {
 		this.onFlagsUpdate?.(this.getMemoryFlags());
+	}
+
+	/**
+	 * Cleanup method to clear outstanding timers and prevent memory leaks.
+	 * Call this method when the manager instance is no longer needed,
+	 * especially in serverless environments or long-running applications.
+	 *
+	 * @example
+	 * ```typescript
+	 * // In serverless functions
+	 * export async function handler() {
+	 *   const manager = new ServerFlagsManager(options);
+	 *   try {
+	 *     // Use manager...
+	 *   } finally {
+	 *     manager.cleanup(); // Prevent memory leaks
+	 *   }
+	 * }
+	 * ```
+	 */
+	public cleanup(): void {
+		// Clear all active timers to prevent memory leaks
+		for (const timer of this.activeTimers) {
+			clearTimeout(timer);
+		}
+		this.activeTimers.clear();
+
+		logger.debug("ServerFlagsManager cleanup completed");
 	}
 }
