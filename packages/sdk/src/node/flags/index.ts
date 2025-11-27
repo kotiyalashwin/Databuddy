@@ -15,6 +15,7 @@ export { ServerFlagsManager } from "./server-manager";
 
 export {
 	createServerFlagsManager,
+	createAndInitializeServerFlagsManager,
 	getServerFlag,
 	isFlagEnabled,
 	fetchAllServerFlags,

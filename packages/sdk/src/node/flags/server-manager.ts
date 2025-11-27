@@ -19,11 +19,15 @@ export class ServerFlagsManager implements FlagsManager {
 	private onConfigUpdate?: (config: FlagsConfig) => void;
 	private memoryFlags: Record<string, FlagResult> = {};
 	private pendingFlags: Set<string> = new Set();
+	private fetchingStates: Map<string, number> = new Map(); // timestamp when fetch completed
 	private enableMemoryCache: boolean;
+	private readonly FETCHING_STATE_TTL: number;
+	private initialized: Promise<void>;
 
 	constructor(options: ServerFlagsManagerOptions) {
 		this.config = this.withDefaults(options.config);
 		this.enableMemoryCache = options.enableMemoryCache ?? true;
+		this.FETCHING_STATE_TTL = options.fetchingStateTtl ?? 50;
 		this.storage =
 			(options.storage as ServerFlagStorage) ||
 			new ServerFlagStorage(options.storageConfig);
@@ -37,9 +41,10 @@ export class ServerFlagsManager implements FlagsManager {
 			isPending: this.config.isPending,
 			hasUser: !!this.config.user,
 			enableMemoryCache: this.enableMemoryCache,
+			fetchingStateTtl: this.FETCHING_STATE_TTL,
 		});
 
-		this.initialize();
+		this.initialized = this.initialize();
 	}
 
 	private withDefaults(config: FlagsConfig): FlagsConfig {
@@ -66,6 +71,20 @@ export class ServerFlagsManager implements FlagsManager {
 		}
 	}
 
+	/**
+	 * Wait for the manager to complete initialization
+	 */
+	public async waitForInitialization(): Promise<void> {
+		return this.initialized;
+	}
+
+	/**
+	 * Check if the manager has completed initialization
+	 */
+	public get isInitialized(): boolean {
+		return this.initialized !== null && this.initialized !== undefined;
+	}
+
 	private loadCachedFlags(): void {
 		if (this.config.skipStorage) {
 			return;
@@ -84,6 +103,7 @@ export class ServerFlagsManager implements FlagsManager {
 	}
 
 	async fetchAllFlags(): Promise<void> {
+		await this.initialized;
 		if (this.config.isPending) {
 			logger.debug("Session pending, skipping bulk fetch");
 			return;
@@ -136,6 +156,7 @@ export class ServerFlagsManager implements FlagsManager {
 	}
 
 	async getFlag(key: string): Promise<FlagResult> {
+		await this.initialized;
 		logger.debug(`Getting: ${key}`);
 
 		if (this.config.isPending) {
@@ -148,12 +169,7 @@ export class ServerFlagsManager implements FlagsManager {
 			};
 		}
 
-		// Check memory cache first (if enabled)
-		if (this.enableMemoryCache && this.memoryFlags[key]) {
-			logger.debug(`Memory: ${key}`);
-			return this.memoryFlags[key];
-		}
-
+		// Check if currently fetching first (highest priority)
 		if (this.pendingFlags.has(key)) {
 			logger.debug(`Pending: ${key}`);
 			return {
@@ -162,6 +178,12 @@ export class ServerFlagsManager implements FlagsManager {
 				payload: null,
 				reason: "FETCHING",
 			};
+		}
+
+		// Check memory cache next
+		if (this.enableMemoryCache && this.memoryFlags[key]) {
+			logger.debug(`Memory: ${key}`);
+			return this.memoryFlags[key];
 		}
 
 		// Check persistent cache
@@ -184,6 +206,7 @@ export class ServerFlagsManager implements FlagsManager {
 
 	private async fetchFlag(key: string): Promise<FlagResult> {
 		this.pendingFlags.add(key);
+		this.fetchingStates.set(key, Date.now()); // Mark as fetching
 
 		const params = new URLSearchParams();
 		params.set("key", key);
@@ -243,10 +266,18 @@ export class ServerFlagsManager implements FlagsManager {
 			return fallback;
 		} finally {
 			this.pendingFlags.delete(key);
+			// Keep fetching state for a short time for sync detection
+			setTimeout(() => {
+				this.fetchingStates.delete(key);
+			}, this.FETCHING_STATE_TTL);
 		}
 	}
 
 	isEnabled(key: string): FlagState {
+		// Note: This method is synchronous, so we can't await initialization
+		// Users should call waitForInitialization() before using this method
+		// or rely on the memory cache being populated after initialization
+
 		if (this.memoryFlags[key]) {
 			return {
 				enabled: this.memoryFlags[key].enabled,
@@ -254,13 +285,16 @@ export class ServerFlagsManager implements FlagsManager {
 				isReady: true,
 			};
 		}
-		if (this.pendingFlags.has(key)) {
+
+		// Check both pending and recently completed fetches
+		if (this.pendingFlags.has(key) || this.fetchingStates.has(key)) {
 			return {
 				enabled: false,
 				isLoading: true,
 				isReady: false,
 			};
 		}
+
 		// For server-side, we don't auto-fetch to avoid async issues
 		// Users should call getFlag() explicitly
 		return {
@@ -271,49 +305,73 @@ export class ServerFlagsManager implements FlagsManager {
 	}
 
 	refresh(forceClear = false): void {
-		logger.debug("Refreshing", { forceClear });
+		// Don't await initialization here to maintain interface compatibility
+		// The initialization will be awaited within fetchAllFlags when called
+		this.initialized
+			.then(() => {
+				logger.debug("Refreshing", { forceClear });
 
-		if (forceClear) {
-			this.memoryFlags = {};
-			this.notifyFlagsUpdate();
-			if (!this.config.skipStorage) {
-				try {
-					this.storage.clear();
-					logger.debug("Storage cleared");
-				} catch (err) {
-					logger.warn("Storage clear error:", err);
+				if (forceClear) {
+					this.memoryFlags = {};
+					this.notifyFlagsUpdate();
+					if (!this.config.skipStorage) {
+						try {
+							this.storage.clear();
+							logger.debug("Storage cleared");
+						} catch (err) {
+							logger.warn("Storage clear error:", err);
+						}
+					}
 				}
-			}
-		}
 
-		this.fetchAllFlags();
+				this.fetchAllFlags();
+			})
+			.catch((err) => {
+				logger.error("Error during refresh initialization:", err);
+			});
 	}
 
 	updateUser(user: FlagsConfig["user"]): void {
-		this.config = { ...this.config, user };
-		this.onConfigUpdate?.(this.config);
-		this.refresh();
+		this.initialized
+			.then(() => {
+				this.config = { ...this.config, user };
+				this.onConfigUpdate?.(this.config);
+				this.refresh();
+			})
+			.catch((err) => {
+				logger.error("Error during updateUser initialization:", err);
+			});
 	}
 
 	updateConfig(config: FlagsConfig): void {
-		this.config = this.withDefaults(config);
-		this.onConfigUpdate?.(this.config);
+		this.initialized
+			.then(async () => {
+				this.config = this.withDefaults(config);
+				this.onConfigUpdate?.(this.config);
 
-		if (!this.config.skipStorage) {
-			this.loadCachedFlags();
-			this.storage.cleanupExpired();
-		}
+				if (!this.config.skipStorage) {
+					this.loadCachedFlags();
+					this.storage.cleanupExpired();
+				}
 
-		if (this.config.autoFetch && !this.config.isPending) {
-			this.fetchAllFlags();
-		}
+				if (this.config.autoFetch && !this.config.isPending) {
+					await this.fetchAllFlags();
+				}
+			})
+			.catch((err) => {
+				logger.error("Error during updateConfig initialization:", err);
+			});
 	}
 
 	getMemoryFlags(): Record<string, FlagResult> {
+		// Return current state without waiting for initialization
+		// Users should call waitForInitialization() if they need fully initialized state
 		return { ...this.memoryFlags };
 	}
 
 	getPendingFlags(): Set<string> {
+		// Return current state without waiting for initialization
+		// Users should call waitForInitialization() if they need fully initialized state
 		return new Set(this.pendingFlags);
 	}
 

@@ -13,6 +13,17 @@ export function createServerFlagsManager(
 }
 
 /**
+ * Create a server-side flags manager and wait for initialization to complete
+ */
+export async function createAndInitializeServerFlagsManager(
+	options: ServerFlagsManagerOptions
+): Promise<ServerFlagsManager> {
+	const manager = new ServerFlagsManager(options);
+	await manager.waitForInitialization();
+	return manager;
+}
+
+/**
  * Hook-like function for server components to check flag status
  */
 export async function getServerFlag(

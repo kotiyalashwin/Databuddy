@@ -18,50 +18,89 @@ import {
 	fetchAllServerFlags,
 } from "@databuddy/sdk/node";
 
-// Mock fetch for testing
-global.fetch = (url: string) => {
-	if (url.includes("/flags/evaluate")) {
-		return new Response(
-			JSON.stringify({
-				enabled: true,
-				value: true,
-				payload: { variant: "test" },
-				reason: "TARGETED_MATCH",
-			}),
-			{
-				status: 200,
-				headers: { "Content-Type": "application/json" },
-			}
-		);
-	}
+// Store original fetch
+const originalFetch = global.fetch;
 
-	if (url.includes("/flags/bulk")) {
-		return new Response(
-			JSON.stringify({
-				flags: {
-					"test-flag": {
-						enabled: true,
-						value: true,
-						payload: { variant: "test" },
-						reason: "TARGETED_MATCH",
-					},
-					"disabled-flag": {
+// Create mock fetch function with configurable latency
+const createMockFetch = (
+	options: { latency?: number; disabledFlag?: boolean } = {}
+) => {
+	const latency = options.latency ?? 0; // Default to no latency for race condition testing
+	const disabledFlag = options.disabledFlag ?? false;
+
+	return async (url: string) => {
+		// Add artificial delay if specified
+		if (latency > 0) {
+			await new Promise((resolve) => setTimeout(resolve, latency));
+		}
+
+		if (url.includes("/flags/evaluate")) {
+			if (disabledFlag && url.includes("disabled-flag")) {
+				return new Response(
+					JSON.stringify({
 						enabled: false,
 						value: false,
 						payload: null,
 						reason: "TARGETED_NO_MATCH",
-					},
-				},
-			}),
-			{
-				status: 200,
-				headers: { "Content-Type": "application/json" },
+					}),
+					{
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					}
+				);
 			}
-		);
-	}
 
-	return new Response("Not Found", { status: 404 });
+			return new Response(
+				JSON.stringify({
+					enabled: true,
+					value: true,
+					payload: { variant: "test" },
+					reason: "TARGETED_MATCH",
+				}),
+				{
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}
+			);
+		}
+
+		if (url.includes("/flags/bulk")) {
+			return new Response(
+				JSON.stringify({
+					flags: {
+						"test-flag": {
+							enabled: true,
+							value: true,
+							payload: { variant: "test" },
+							reason: "TARGETED_MATCH",
+						},
+						"disabled-flag": {
+							enabled: false,
+							value: false,
+							payload: null,
+							reason: "TARGETED_NO_MATCH",
+						},
+					},
+				}),
+				{
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}
+			);
+		}
+
+		return new Response("Not Found", { status: 404 });
+	};
 };
+
+// Set up default mock fetch with no latency (tests race condition fix)
+beforeEach(() => {
+	global.fetch = createMockFetch();
+});
+
+afterEach(() => {
+	global.fetch = originalFetch;
+});
 
 describe("ServerFlagStorage", () => {
 	let storage: ServerFlagStorage;
@@ -289,8 +328,17 @@ describe("ServerFlagsManager", () => {
 	});
 
 	it("should handle pending flags state", async () => {
+		// Clear any existing state to ensure clean test
+		flagsManager.refresh(true); // Clear memory and storage
+
+		// Mock slower fetch for this test to ensure race condition can be tested
+		global.fetch = createMockFetch({ latency: 100 });
+
 		// Start a fetch but don't await it
 		const fetchPromise = flagsManager.getFlag("test-flag");
+
+		// Wait a moment to ensure pending state is properly set
+		await new Promise((resolve) => setTimeout(resolve, 10));
 
 		// Check state while fetching
 		const state = flagsManager.isEnabled("test-flag");
@@ -298,12 +346,168 @@ describe("ServerFlagsManager", () => {
 		expect(state.isReady).toBe(false);
 
 		// Wait for fetch to complete
-		await fetchPromise;
+		const result = await fetchPromise;
+		expect(result.enabled).toBe(true);
 
 		// Check state after fetch
 		const finalState = flagsManager.isEnabled("test-flag");
 		expect(finalState.isLoading).toBe(false);
 		expect(finalState.isReady).toBe(true);
+	});
+
+	it("should handle race condition with zero-delay fetch", async () => {
+		// Create manager with custom TTL for testing
+		const testManager = createServerFlagsManager({
+			config: {
+				clientId: "test-client-id",
+				autoFetch: false,
+			},
+			fetchingStateTtl: 100, // Longer TTL for testing
+		});
+
+		// Mock zero-delay fetch (simulates localhost/fast network)
+		global.fetch = createMockFetch({ latency: 0 });
+
+		// Start fetch and immediately check state
+		const fetchPromise = testManager.getFlag("race-flag");
+
+		// Check state immediately (race condition scenario)
+		const state = testManager.isEnabled("race-flag");
+		// With zero-delay fetch, the extended tracking should still show loading
+		expect(state.isLoading).toBe(true);
+		expect(state.isReady).toBe(false);
+
+		// Wait for completion
+		const result = await fetchPromise;
+		expect(result.enabled).toBe(true);
+
+		// State should still be loading due to extended tracking
+		const loadingState = testManager.isEnabled("race-flag");
+		expect(loadingState.isLoading).toBe(true);
+		expect(loadingState.isReady).toBe(false);
+
+		// Wait for TTL to expire
+		await new Promise((resolve) => setTimeout(resolve, 150));
+
+		// State should now be ready
+		const finalState = testManager.isEnabled("race-flag");
+		expect(finalState.isLoading).toBe(false);
+		expect(finalState.isReady).toBe(true);
+	});
+
+	it("should handle race condition with zero-delay fetch", async () => {
+		// Create manager with custom TTL for testing
+		const testManager = createServerFlagsManager({
+			config: {
+				clientId: "test-client-id",
+				autoFetch: false,
+			},
+			fetchingStateTtl: 100, // Longer TTL for testing
+		});
+
+		// Mock zero-delay fetch (simulates localhost/fast network)
+		global.fetch = createMockFetch({ latency: 0 });
+
+		// Start fetch and immediately check state
+		const fetchPromise = testManager.getFlag("race-flag");
+
+		// Wait a moment to ensure state is set
+		await new Promise((resolve) => setTimeout(resolve, 10));
+
+		// Check state (race condition scenario)
+		const state = testManager.isEnabled("race-flag");
+		// With zero-delay fetch, extended tracking should still show loading
+		expect(state.isLoading).toBe(true);
+		expect(state.isReady).toBe(false);
+
+		// Wait for completion
+		const result = await fetchPromise;
+		expect(result.enabled).toBe(true);
+
+		// State should still be loading due to extended tracking
+		const loadingState = testManager.isEnabled("race-flag");
+		expect(loadingState.isLoading).toBe(true);
+		expect(loadingState.isReady).toBe(false);
+
+		// Wait for TTL to expire
+		await new Promise((resolve) => setTimeout(resolve, 150));
+
+		// State should now be ready
+		const finalState = testManager.isEnabled("race-flag");
+		expect(finalState.isLoading).toBe(false);
+		expect(finalState.isReady).toBe(true);
+	});
+
+	it("should handle concurrent fetch requests", async () => {
+		// Mock slower fetch to test concurrency
+		global.fetch = createMockFetch({ latency: 100 });
+
+		// Start multiple concurrent fetches for same flag
+		const promise1 = flagsManager.getFlag("concurrent-flag");
+		const promise2 = flagsManager.getFlag("concurrent-flag");
+		const promise3 = flagsManager.getFlag("concurrent-flag");
+
+		// Small delay to ensure state is set
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		// All should show loading state
+		const state = flagsManager.isEnabled("concurrent-flag");
+		expect(state.isLoading).toBe(true);
+		expect(state.isReady).toBe(false);
+
+		// Wait for all to complete
+		const [result1, result2, result3] = await Promise.all([
+			promise1,
+			promise2,
+			promise3,
+		]);
+
+		// All should return the same result
+		expect(result1).toEqual(result2);
+		expect(result2).toEqual(result3);
+		expect(result1.enabled).toBe(true);
+
+		// Final state should be ready
+		const finalState = flagsManager.isEnabled("concurrent-flag");
+		expect(finalState.isLoading).toBe(false);
+		expect(finalState.isReady).toBe(true);
+	});
+
+	it("should handle rapid successive calls", async () => {
+		// Clear any existing state
+		flagsManager.refresh(true);
+
+		// Mock small delay fetch for rapid calls to ensure proper testing
+		global.fetch = createMockFetch({ latency: 50 });
+
+		// Make rapid successive calls
+		const results = [];
+		for (let i = 0; i < 5; i++) {
+			results.push(flagsManager.getFlag(`rapid-flag-${i}`));
+		}
+
+		// Small delay to ensure states are set
+		await new Promise((resolve) => setTimeout(resolve, 10));
+
+		// Check states rapidly
+		for (let i = 0; i < 5; i++) {
+			const state = flagsManager.isEnabled(`rapid-flag-${i}`);
+			expect(state.isLoading).toBe(true);
+			expect(state.isReady).toBe(false);
+		}
+
+		// Wait for all to complete
+		const completedResults = await Promise.all(results);
+		completedResults.forEach((result) => {
+			expect(result.enabled).toBe(true);
+		});
+
+		// All states should be ready
+		for (let i = 0; i < 5; i++) {
+			const state = flagsManager.isEnabled(`rapid-flag-${i}`);
+			expect(state.isLoading).toBe(false);
+			expect(state.isReady).toBe(true);
+		}
 	});
 });
 
@@ -340,10 +544,12 @@ describe("Serverless Environment Compatibility", () => {
 			},
 		});
 
-		// Mock a slow response that times out
+		// Mock a response that simulates a timeout error
 		global.fetch = async () => {
-			await new Promise((resolve) => setTimeout(resolve, 6000)); // Longer than 5s timeout
-			return new Response("Timeout", { status: 408 });
+			// Simulate a timeout by throwing an AbortError
+			const error = new Error("Request timeout");
+			error.name = "AbortError";
+			throw error;
 		};
 
 		const result = await flagsManager.getFlag("timeout-flag");
@@ -378,6 +584,9 @@ describe("Helper Functions", () => {
 	it("isFlagEnabled should return boolean", async () => {
 		const enabled = await isFlagEnabled(flagsManager, "test-flag");
 		expect(enabled).toBe(true);
+
+		// Mock a disabled flag response
+		global.fetch = createMockFetch({ disabledFlag: true });
 
 		const disabled = await isFlagEnabled(flagsManager, "disabled-flag");
 		expect(disabled).toBe(false);

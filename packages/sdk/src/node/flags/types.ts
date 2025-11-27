@@ -14,4 +14,6 @@ export interface ServerFlagsManagerOptions extends FlagsManagerOptions {
 	storageConfig?: ServerStorageConfig;
 	/** Enable memory caching for serverless environments */
 	enableMemoryCache?: boolean;
+	/** Time to keep fetching state after completion (ms, default: 50) */
+	fetchingStateTtl?: number;
 }
