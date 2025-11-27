@@ -95,7 +95,7 @@ export class ServerFlagsManager implements FlagsManager {
 		}
 
 		if (this.config.autoFetch && !this.config.isPending) {
-			await this.fetchAllFlags();
+			await this.fetchAllFlags(true);
 		}
 	}
 
@@ -130,8 +130,10 @@ export class ServerFlagsManager implements FlagsManager {
 		}
 	}
 
-	async fetchAllFlags(): Promise<void> {
-		await this.initialized;
+	async fetchAllFlags(skipInitWait: boolean = false): Promise<void> {
+		if (!skipInitWait) {
+			await this.initialized;
+		}
 		if (this.config.isPending) {
 			logger.debug("Session pending, skipping bulk fetch");
 			return;
@@ -355,9 +357,9 @@ export class ServerFlagsManager implements FlagsManager {
 					}
 				}
 
-				this.fetchAllFlags().catch(err=>{
-                    logger.error("Error during refresh fetch:",err)
-                });
+				this.fetchAllFlags().catch((err) => {
+					logger.error("Error during refresh fetch:", err);
+				});
 			})
 			.catch((err) => {
 				logger.error("Error during refresh initialization:", err);
@@ -388,7 +390,7 @@ export class ServerFlagsManager implements FlagsManager {
 				}
 
 				if (this.config.autoFetch && !this.config.isPending) {
-					await this.fetchAllFlags();
+					await this.fetchAllFlags(true);
 				}
 			})
 			.catch((err) => {
